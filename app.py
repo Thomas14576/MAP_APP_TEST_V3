@@ -12,7 +12,7 @@ import folium
 from streamlit_folium import st_folium
 
 st.set_page_config(layout="wide")
-st.title("DEBUG MODE – Google My Maps to SVG Exporter (Interactive)")
+st.title("Google My Maps to SVG Exporter (Working Viewport Cropping)")
 
 shutil.rmtree("svg_layers", ignore_errors=True)
 os.makedirs("svg_layers", exist_ok=True)
@@ -88,13 +88,67 @@ if input_url:
 
         map_data = st_folium(m, width=700, height=500)
 
-        # --- DEBUG OUTPUT ---
-        if map_data:
-            if "bounds" not in map_data or not map_data["bounds"]:
-                st.warning("DEBUG: No map bounds returned yet.")
-            else:
-                bounds = map_data["bounds"]
-                st.success("DEBUG: Map bounds received.")
-                st.text(f"Raw bounds: {bounds}")
+        if not map_data or "bounds" not in map_data or not map_data["bounds"]:
+            st.warning("Zoom or move the map to activate export.")
         else:
-            st.warning("DEBUG: No map_data received at all.")
+            bounds = map_data["bounds"]
+            if not all(k in bounds for k in ("_southWest", "_northEast")):
+                st.warning("Incomplete bounds returned. Try panning or zooming again.")
+            else:
+                # ✅ Correctly extract bounds
+                south = bounds["_southWest"]["lat"]
+                west = bounds["_southWest"]["lng"]
+                north = bounds["_northEast"]["lat"]
+                east = bounds["_northEast"]["lng"]
+
+                def normalize_coords(lon, lat, width=1000, height=1000):
+                    x = (lon - west) / (east - west) * width
+                    y = height - (lat - south) / (north - south) * height
+                    return x, y
+
+                has_visible_data = False
+
+                for folder_name in selected_folders:
+                    coords = folder_coords[folder_name]
+                    visible_coords = [(lat, lon) for lat, lon in coords if south < lat < north and west < lon < east]
+                    if not visible_coords:
+                        continue
+                    has_visible_data = True
+                    norm_coords = [normalize_coords(lon, lat) for lat, lon in visible_coords]
+
+                    doc = Document()
+                    svg = doc.createElement('svg')
+                    svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+                    svg.setAttribute('width', '1000')
+                    svg.setAttribute('height', '1000')
+                    doc.appendChild(svg)
+
+                    for x, y in norm_coords:
+                        circle = doc.createElement('circle')
+                        circle.setAttribute('cx', str(x))
+                        circle.setAttribute('cy', str(y))
+                        circle.setAttribute('r', '5')
+                        circle.setAttribute('fill', 'red')
+                        svg.appendChild(circle)
+
+                    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', folder_name)
+                    filename = f"svg_layers/{safe_name}.svg"
+                    with open(filename, "w") as f:
+                        f.write(doc.toprettyxml())
+
+                if has_visible_data:
+                    zip_buf = BytesIO()
+                    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        for svg_file in os.listdir("svg_layers"):
+                            path = os.path.join("svg_layers", svg_file)
+                            zipf.write(path, svg_file)
+
+                    st.markdown("### Download Export")
+                    st.download_button(
+                        label="Download SVG ZIP",
+                        data=zip_buf.getvalue(),
+                        file_name="svg_layers_export.zip",
+                        mime="application/zip"
+                    )
+                else:
+                    st.warning("No visible points in the current map view. Zoom or pan to include data.")
