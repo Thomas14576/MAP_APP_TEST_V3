@@ -1,78 +1,71 @@
-
 import streamlit as st
-from streamlit_folium import st_folium
-import folium
-import zipfile
-import simplekml
+import requests
 import xml.etree.ElementTree as ET
-import io
-import base64
+import zipfile
+import os
+import shutil
+from io import BytesIO
+import folium
+from streamlit_folium import st_folium
+import uuid
 
 st.set_page_config(layout="wide")
 st.title("Google My Maps to SVG Exporter")
 
-# Input: Google My Maps URL
-map_url = st.text_input("Paste your Google My Maps URL:", "")
+# Get user URL
+map_url = st.text_input("Paste your Google My Maps URL", "")
 
-# Export pins checkbox
-export_all = st.checkbox("Export all pins (ignore zoom)", value=False)
+def extract_mid(url):
+    import re
+    match = re.search(r"mid=([^&]+)", url)
+    return match.group(1) if match else None
 
-# Initialize layer toggles and colors
-layer_names = [
-    "Fly - WA.xlsx", "Large Format - WA.xlsx", "Retail - WA.xlsx",
-    "Street Digital - WA.xlsx", "Office - WA.xlsx", "Study - WA.xlsx", "Commute Posters AU - WA.xlsx"
-]
-hex_presets = ["#FF5F2C", "#FF3119"]
+@st.cache_data(show_spinner=False)
+def fetch_kml(mid):
+    kml_url = f"https://www.google.com/maps/d/kml?mid={mid}&forcekml=1"
+    response = requests.get(kml_url)
+    if response.status_code != 200:
+        st.error("Failed to fetch KML. Check if your map is set to 'Anyone with the link can view'.")
+        return None
+    return response.content
 
-st.markdown("### Select layers and their colors")
+def parse_kml(kml_data):
+    tree = ET.ElementTree(ET.fromstring(kml_data))
+    root = tree.getroot()
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
+    placemarks = root.findall(".//kml:Placemark", ns)
+    points = []
+    for pm in placemarks:
+        name = pm.find("kml:name", ns)
+        point = pm.find(".//kml:Point/kml:coordinates", ns)
+        if point is not None:
+            coords = point.text.strip().split(",")
+            points.append({
+                "name": name.text if name is not None else "Unnamed",
+                "lon": float(coords[0]),
+                "lat": float(coords[1])
+            })
+    return points
 
-selected_layers = []
-layer_colors = {}
-
-cols = st.columns([2, 2])
-for idx, name in enumerate(layer_names):
-    button_key = f"btn_{name}"
-    if cols[0].toggle(name, key=button_key, value=True):
-        selected_layers.append(name)
-        color_key = f"color_{name}"
-        choice = cols[1].selectbox(f"Color for {name}", options=hex_presets + ["Custom"], key=color_key)
-        if choice == "Custom":
-            custom_key = f"custom_{name}"
-            custom_hex = cols[1].text_input(f"Custom HEX for {name}", "#FF0000", key=custom_key)
-            layer_colors[name] = custom_hex
+if map_url:
+    mid = extract_mid(map_url)
+    if mid:
+        kml_data = fetch_kml(mid)
+        if kml_data:
+            pins = parse_kml(kml_data)
+            if pins:
+                st.success(f"Loaded {len(pins)} pins from map.")
+                avg_lat = sum(p['lat'] for p in pins) / len(pins)
+                avg_lon = sum(p['lon'] for p in pins) / len(pins)
+                m = folium.Map(location=[avg_lat, avg_lon], zoom_start=5)
+                for p in pins:
+                    folium.CircleMarker(location=(p["lat"], p["lon"]), radius=6, fill=True, color="#FF5F2C", popup=p["name"]).add_to(m)
+                st_folium(m, height=500, width=1000)
+            else:
+                st.warning("No pins found in KML.")
         else:
-            layer_colors[name] = choice
-
-# Create Folium map
-m = folium.Map(location=[-25.0, 134.0], zoom_start=5, control_scale=True)
-
-# Display folium map with zoom and pan
-with st.container():
-    st.markdown("### Map Preview (Pan & Zoom to crop)")
-    map_state = st_folium(m, height=500, returned_objects=["bounds", "zoom"])
-
-bounds = map_state.get("bounds")
-
-if bounds:
-    st.success("Map bounds received.")
-    st.code(str(bounds))
-    download_ready = True
+            st.warning("Could not download KML file.")
+    else:
+        st.warning("Could not extract map ID from the URL.")
 else:
-    download_ready = False
-    st.warning("Incomplete map bounds detected. Try zooming or panning again.")
-
-# Download button logic
-if st.button("Download SVG + Pins", disabled=not download_ready and not export_all):
-    # Dummy SVG & CSV content for now
-    svg_content = "<svg><circle cx='50' cy='50' r='40' fill='orange' /></svg>"
-    csv_content = "Name,Lat,Lng\nSample Pin,-33.86,151.20"
-
-    # Create zip
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("map.svg", svg_content)
-        zf.writestr("pins.csv", csv_content)
-
-    b64 = base64.b64encode(zip_buffer.getvalue()).decode()
-    href = f'<a href="data:application/zip;base64,{b64}" download="map_export.zip">Click to download ZIP</a>'
-    st.markdown(href, unsafe_allow_html=True)
+    st.info("Paste a Google My Maps shareable URL above.")
