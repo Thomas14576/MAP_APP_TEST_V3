@@ -1,7 +1,5 @@
-
 streamlit
 streamlit-folium
+folium
 simplekml
-xmltodict
-requests
-beautifulsoup4
+lxml
