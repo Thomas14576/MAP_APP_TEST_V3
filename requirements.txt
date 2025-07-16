@@ -1,4 +1,5 @@
 streamlit
 requests
-lxml
-pandas
+pygments
+folium
+streamlit-folium
