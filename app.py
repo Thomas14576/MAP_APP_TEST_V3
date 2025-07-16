@@ -1,164 +1,91 @@
-
 import streamlit as st
-import zipfile
-import os
-import shutil
-import xml.etree.ElementTree as ET
-from xml.dom.minidom import Document
-import re
-from io import BytesIO
-import folium
 from streamlit_folium import st_folium
+import folium
+from folium.plugins import Draw
+import requests
+import zipfile
+import io
+import xml.etree.ElementTree as ET
+import base64
+from xml.dom.minidom import parseString
+from collections import defaultdict
 
-# Setup
 st.set_page_config(layout="wide")
+
 st.title("Google My Maps to SVG Exporter")
 
-# Clean up and prepare folders
-shutil.rmtree("svg_layers", ignore_errors=True)
-os.makedirs("svg_layers", exist_ok=True)
-
-# Input Google My Maps URL
+# Input
 url = st.text_input("Paste your Google My Maps URL")
 
-# Extract Map ID
-map_id = None
-if "mid=" in url:
-    match = re.search(r'mid=([^&]+)', url)
-    if match:
-        map_id = match.group(1)
-        kml_download_url = f"https://www.google.com/maps/d/kml?mid={map_id}"
-        kmz_path = "downloaded.kmz"
-        with open(kmz_path, "wb") as f:
-            import requests
-            f.write(requests.get(kml_download_url).content)
+def download_kml(kml_url):
+    if "mid=" not in kml_url:
+        st.error("Invalid My Maps URL")
+        return None
+    map_id = kml_url.split("mid=")[-1].split("&")[0]
+    download_url = f"https://www.google.com/maps/d/kml?forcekml=1&mid={map_id}"
+    response = requests.get(download_url)
+    if response.status_code != 200:
+        st.error("Failed to download KML")
+        return None
+    if b"<?xml" not in response.content:
+        st.error("Not valid KML data")
+        return None
+    return response.content
 
-        # Extract KML
-        kml_file = None
-        with zipfile.ZipFile(kmz_path, 'r') as kmz:
-            for name in kmz.namelist():
-                if name.endswith(".kml"):
-                    kmz.extract(name, path=".")
-                    kml_file = name
-                    break
+def parse_kml(kml_data):
+    layers = defaultdict(list)
+    try:
+        tree = ET.fromstring(kml_data)
+        for doc in tree.iter("{http://www.opengis.net/kml/2.2}Document"):
+            for folder in doc.findall("{http://www.opengis.net/kml/2.2}Folder"):
+                name_elem = folder.find("{http://www.opengis.net/kml/2.2}name")
+                if name_elem is None:
+                    continue
+                folder_name = name_elem.text
+                for pm in folder.findall("{http://www.opengis.net/kml/2.2}Placemark"):
+                    coords = pm.find(".//{http://www.opengis.net/kml/2.2}coordinates")
+                    if coords is not None:
+                        try:
+                            lon, lat = map(float, coords.text.strip().split(",")[:2])
+                            layers[folder_name].append((lat, lon))
+                        except:
+                            continue
+    except ET.ParseError as e:
+        st.error(f"XML Parse Error: {e}")
+    return layers
 
-        # Parse KML
-        tree = ET.parse(kml_file)
-        root = tree.getroot()
-        ns = {'kml': 'http://www.opengis.net/kml/2.2'}
-        folders = root.findall('.//kml:Folder', ns)
-        all_coords = []
-        folder_coords = {}
+# If URL is provided, download and parse KML
+if url:
+    kml = download_kml(url)
+    if kml:
+        layers = parse_kml(kml)
+        st.success(f"Loaded {sum(len(p) for p in layers.values())} pins from map.")
+    else:
+        layers = {}
+else:
+    layers = {}
 
-        for folder in folders:
-            folder_name_elem = folder.find('kml:name', ns)
-            folder_name = folder_name_elem.text.strip() if folder_name_elem is not None else 'Unnamed'
-            coords = []
-            for placemark in folder.findall('.//kml:Placemark', ns):
-                for point in placemark.findall('.//kml:Point', ns):
-                    coord_text = point.find('.//kml:coordinates', ns).text.strip()
-                    lon, lat, *_ = map(float, coord_text.split(','))
-                    coords.append((lon, lat))
-                    all_coords.append((lon, lat))
-            if coords:
-                folder_coords[folder_name] = coords
+# Choose layers
+selected_layers = st.multiselect("Select layers to export", list(layers.keys()), default=list(layers.keys()))
 
-        if folder_coords:
-            # Full export toggle
-            export_all = st.checkbox("Export all pins (ignore zoom)", value=False)
+# Map + bounds detection
+with st.container():
+    m = folium.Map(location=[-25, 135], zoom_start=4, control_scale=True)
+    for lname in selected_layers:
+        for lat, lon in layers[lname]:
+            folium.CircleMarker([lat, lon], radius=5, color="orange", fill=True).add_to(m)
 
-            # Setup folium map
-            center_lat = sum([lat for _, lat in all_coords]) / len(all_coords)
-            center_lon = sum([lon for lon, _ in all_coords]) / len(all_coords)
-            fmap = folium.Map(location=[center_lat, center_lon], zoom_start=5)
+    # Add draw control
+    Draw(export=True).add_to(m)
+    st_data = st_folium(m, width=700, height=500)
 
-            for coords in all_coords:
-                folium.CircleMarker(location=(coords[1], coords[0]), radius=3, color='red').add_to(fmap)
+# Bounds info
+if st_data and "bounds" in st_data and st_data["bounds"]:
+    st.success(f"DEBUG: Map bounds received.
+Raw bounds: {st_data['bounds']}")
+else:
+    st.warning("DEBUG: Incomplete map bounds detected. Try zooming or panning again.")
 
-            map_data = st_folium(fmap, height=500, returned_objects=[])
-            bounds = map_data.get("bounds", {})
-
-            export_ready = False
-            if export_all:
-                export_bounds = None
-                export_ready = True
-            elif "_southWest" in bounds and "_northEast" in bounds:
-                sw = bounds["_southWest"]
-                ne = bounds["_northEast"]
-                export_bounds = (sw["lng"], ne["lng"], sw["lat"], ne["lat"])
-                export_ready = True
-            else:
-                st.warning("Incomplete map bounds detected. Try zooming or panning again.")
-                export_ready = False
-
-            st.markdown("---")
-            st.subheader("Select layers and their colors")
-
-            selected_folders = []
-            folder_colors = {}
-            predefined_colors = ["#FF5F2C", "#FF3119"]
-
-            for folder in folder_coords:
-                col1, col2 = st.columns([1, 2])
-                with col1:
-                    selected = st.checkbox(folder, value=True)
-                with col2:
-                    color_choice = st.selectbox(
-                        f"Color for '{folder}'", predefined_colors + ["Custom HEX"], key=folder
-                    )
-                    if color_choice == "Custom HEX":
-                        color_choice = st.text_input(f"Custom HEX for '{folder}'", "#000000", key=folder+"_custom")
-                if selected:
-                    selected_folders.append(folder)
-                    folder_colors[folder] = color_choice
-
-            if export_ready:
-                width, height = 1000, 1000
-
-                def normalize_coords(lon, lat, min_lon, max_lon, min_lat, max_lat):
-                    x = (lon - min_lon) / (max_lon - min_lon) * width
-                    y = height - (lat - min_lat) / (max_lat - min_lat) * height
-                    return x, y
-
-                # Determine bounds
-                if export_all:
-                    lons, lats = zip(*all_coords)
-                    min_lon, max_lon = min(lons), max(lons)
-                    min_lat, max_lat = min(lats), max(lats)
-                else:
-                    min_lon, max_lon, min_lat, max_lat = export_bounds
-
-                for folder in selected_folders:
-                    coords = folder_coords[folder]
-                    if not export_all:
-                        coords = [(lon, lat) for lon, lat in coords if (
-                            min_lon <= lon <= max_lon and min_lat <= lat <= max_lat)]
-                    norm_coords = [normalize_coords(lon, lat, min_lon, max_lon, min_lat, max_lat) for lon, lat in coords]
-
-                    doc = Document()
-                    svg = doc.createElement("svg")
-                    svg.setAttribute("xmlns", "http://www.w3.org/2000/svg")
-                    svg.setAttribute("width", str(width))
-                    svg.setAttribute("height", str(height))
-                    doc.appendChild(svg)
-
-                    for x, y in norm_coords:
-                        circle = doc.createElement("circle")
-                        circle.setAttribute("cx", str(x))
-                        circle.setAttribute("cy", str(y))
-                        circle.setAttribute("r", "5")
-                        circle.setAttribute("fill", folder_colors[folder])
-                        svg.appendChild(circle)
-
-                    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', folder)
-                    filename = f"svg_layers/{safe_name}.svg"
-                    with open(filename, "w") as f:
-                        f.write(doc.toprettyxml())
-
-                zip_buf = BytesIO()
-                with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    for svg_file in os.listdir("svg_layers"):
-                        path = os.path.join("svg_layers", svg_file)
-                        zipf.write(path, svg_file)
-
-                st.download_button("⬇️ Download SVG ZIP", data=zip_buf.getvalue(), file_name="svg_layers_export.zip", mime="application/zip")
+# Download stub
+if st.button("Download SVG"):
+    st.write("This will later trigger SVG generation...")
