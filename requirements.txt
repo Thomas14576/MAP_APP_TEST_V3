@@ -1,4 +1,8 @@
 streamlit
+simplekml
+shapely
+lxml
 requests
+matplotlib
+pandas
 folium
-streamlit-folium
