@@ -1,0 +1,5 @@
+streamlit
+requests
+pygments
+folium
+streamlit-folium
