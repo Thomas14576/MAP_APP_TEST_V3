@@ -1,2 +1,5 @@
-streamlit==1.25.0
+streamlit
 requests
+pygments
+folium
+streamlit-folium

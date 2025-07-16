@@ -1,101 +1,164 @@
-import streamlit as st
-import requests
-import zipfile
-import io
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
-import re
-import base64
 
-st.set_page_config(page_title="Google My Maps to SVG Exporter", layout="wide")
+import streamlit as st
+import zipfile
+import os
+import shutil
+import xml.etree.ElementTree as ET
+from xml.dom.minidom import Document
+import re
+from io import BytesIO
+import folium
+from streamlit_folium import st_folium
+
+# Setup
+st.set_page_config(layout="wide")
 st.title("Google My Maps to SVG Exporter")
 
-# Input field
-user_input = st.text_input("Paste your Google My Maps URL")
+# Clean up and prepare folders
+shutil.rmtree("svg_layers", ignore_errors=True)
+os.makedirs("svg_layers", exist_ok=True)
 
-# Function to extract KML URL
-def extract_kml_url(viewer_url):
-    match = re.search(r"mid=([^&]+)", viewer_url)
-    if not match:
-        return None
-    map_id = match.group(1)
-    return f"https://www.google.com/maps/d/kml?mid={map_id}"
+# Input Google My Maps URL
+url = st.text_input("Paste your Google My Maps URL")
 
-# Function to download and unzip KMZ/KML
-def fetch_kml(kml_url):
-    response = requests.get(kml_url)
-    if response.status_code != 200:
-        return None, "Failed to fetch KML."
-    if response.headers.get("Content-Type", "").startswith("application/vnd.google-earth.kmz"):
-        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            for name in zf.namelist():
+# Extract Map ID
+map_id = None
+if "mid=" in url:
+    match = re.search(r'mid=([^&]+)', url)
+    if match:
+        map_id = match.group(1)
+        kml_download_url = f"https://www.google.com/maps/d/kml?mid={map_id}"
+        kmz_path = "downloaded.kmz"
+        with open(kmz_path, "wb") as f:
+            import requests
+            f.write(requests.get(kml_download_url).content)
+
+        # Extract KML
+        kml_file = None
+        with zipfile.ZipFile(kmz_path, 'r') as kmz:
+            for name in kmz.namelist():
                 if name.endswith(".kml"):
-                    return zf.read(name), None
-        return None, "KMZ file found, but no KML inside."
-    return response.content, None
+                    kmz.extract(name, path=".")
+                    kml_file = name
+                    break
 
-# Function to extract folders and placemarks
-def parse_kml(kml_data):
-    try:
-        root = ET.fromstring(kml_data)
+        # Parse KML
+        tree = ET.parse(kml_file)
+        root = tree.getroot()
         ns = {'kml': 'http://www.opengis.net/kml/2.2'}
-        folders = root.findall(".//kml:Folder", ns)
-        data = {}
+        folders = root.findall('.//kml:Folder', ns)
+        all_coords = []
+        folder_coords = {}
+
         for folder in folders:
-            name = folder.find("kml:name", ns).text
-            placemarks = folder.findall("kml:Placemark", ns)
-            data[name] = placemarks
-        return data
-    except Exception as e:
-        return {}
+            folder_name_elem = folder.find('kml:name', ns)
+            folder_name = folder_name_elem.text.strip() if folder_name_elem is not None else 'Unnamed'
+            coords = []
+            for placemark in folder.findall('.//kml:Placemark', ns):
+                for point in placemark.findall('.//kml:Point', ns):
+                    coord_text = point.find('.//kml:coordinates', ns).text.strip()
+                    lon, lat, *_ = map(float, coord_text.split(','))
+                    coords.append((lon, lat))
+                    all_coords.append((lon, lat))
+            if coords:
+                folder_coords[folder_name] = coords
 
-# SVG exporter
-def generate_svg(placemarks, color="#FF5F2C"):
-    svg = minidom.Document()
-    svg_el = svg.createElement("svg")
-    svg_el.setAttribute("xmlns", "http://www.w3.org/2000/svg")
-    svg_el.setAttribute("width", "800")
-    svg_el.setAttribute("height", "600")
-    svg.appendChild(svg_el)
+        if folder_coords:
+            # Full export toggle
+            export_all = st.checkbox("Export all pins (ignore zoom)", value=False)
 
-    for pm in placemarks:
-        name = pm.find("name").text if pm.find("name") is not None else "No Name"
-        point = pm.find(".//Point/coordinates")
-        if point is not None:
-            coords = point.text.strip().split(",")
-            x = float(coords[0]) % 800
-            y = float(coords[1]) % 600
-            circle = svg.createElement("circle")
-            circle.setAttribute("cx", str(x))
-            circle.setAttribute("cy", str(y))
-            circle.setAttribute("r", "5")
-            circle.setAttribute("fill", color)
-            circle.setAttribute("title", name)
-            svg_el.appendChild(circle)
+            # Setup folium map
+            center_lat = sum([lat for _, lat in all_coords]) / len(all_coords)
+            center_lon = sum([lon for lon, _ in all_coords]) / len(all_coords)
+            fmap = folium.Map(location=[center_lat, center_lon], zoom_start=5)
 
-    return svg.toprettyxml(indent="  ")
+            for coords in all_coords:
+                folium.CircleMarker(location=(coords[1], coords[0]), radius=3, color='red').add_to(fmap)
 
-if user_input:
-    kml_url = extract_kml_url(user_input)
-    if kml_url:
-        kml_data, err = fetch_kml(kml_url)
-        if err:
-            st.error(err)
-        else:
-            layers = parse_kml(kml_data)
-            if not layers:
-                st.error("No layers found or KML parsing failed.")
+            map_data = st_folium(fmap, height=500, returned_objects=[])
+            bounds = map_data.get("bounds", {})
+
+            export_ready = False
+            if export_all:
+                export_bounds = None
+                export_ready = True
+            elif "_southWest" in bounds and "_northEast" in bounds:
+                sw = bounds["_southWest"]
+                ne = bounds["_northEast"]
+                export_bounds = (sw["lng"], ne["lng"], sw["lat"], ne["lat"])
+                export_ready = True
             else:
-                selected = st.multiselect("Select layers to export", list(layers.keys()), default=list(layers.keys()))
-                color = st.color_picker("Select pin color", "#FF5F2C")
+                st.warning("Incomplete map bounds detected. Try zooming or panning again.")
+                export_ready = False
 
-                if st.button("Download SVG"):
-                    svg_data = ""
-                    for layer_name in selected:
-                        svg_data += generate_svg(layers[layer_name], color=color)
+            st.markdown("---")
+            st.subheader("Select layers and their colors")
 
-                    b64 = base64.b64encode(svg_data.encode()).decode()
-                    href = f'<a href="data:image/svg+xml;base64,{b64}" download="export.svg">Click to download SVG</a>'
-                    st.markdown(href, unsafe_allow_html=True)
-    else:
-        st.error("Could not extract a valid map ID from the URL.")
+            selected_folders = []
+            folder_colors = {}
+            predefined_colors = ["#FF5F2C", "#FF3119"]
+
+            for folder in folder_coords:
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    selected = st.checkbox(folder, value=True)
+                with col2:
+                    color_choice = st.selectbox(
+                        f"Color for '{folder}'", predefined_colors + ["Custom HEX"], key=folder
+                    )
+                    if color_choice == "Custom HEX":
+                        color_choice = st.text_input(f"Custom HEX for '{folder}'", "#000000", key=folder+"_custom")
+                if selected:
+                    selected_folders.append(folder)
+                    folder_colors[folder] = color_choice
+
+            if export_ready:
+                width, height = 1000, 1000
+
+                def normalize_coords(lon, lat, min_lon, max_lon, min_lat, max_lat):
+                    x = (lon - min_lon) / (max_lon - min_lon) * width
+                    y = height - (lat - min_lat) / (max_lat - min_lat) * height
+                    return x, y
+
+                # Determine bounds
+                if export_all:
+                    lons, lats = zip(*all_coords)
+                    min_lon, max_lon = min(lons), max(lons)
+                    min_lat, max_lat = min(lats), max(lats)
+                else:
+                    min_lon, max_lon, min_lat, max_lat = export_bounds
+
+                for folder in selected_folders:
+                    coords = folder_coords[folder]
+                    if not export_all:
+                        coords = [(lon, lat) for lon, lat in coords if (
+                            min_lon <= lon <= max_lon and min_lat <= lat <= max_lat)]
+                    norm_coords = [normalize_coords(lon, lat, min_lon, max_lon, min_lat, max_lat) for lon, lat in coords]
+
+                    doc = Document()
+                    svg = doc.createElement("svg")
+                    svg.setAttribute("xmlns", "http://www.w3.org/2000/svg")
+                    svg.setAttribute("width", str(width))
+                    svg.setAttribute("height", str(height))
+                    doc.appendChild(svg)
+
+                    for x, y in norm_coords:
+                        circle = doc.createElement("circle")
+                        circle.setAttribute("cx", str(x))
+                        circle.setAttribute("cy", str(y))
+                        circle.setAttribute("r", "5")
+                        circle.setAttribute("fill", folder_colors[folder])
+                        svg.appendChild(circle)
+
+                    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', folder)
+                    filename = f"svg_layers/{safe_name}.svg"
+                    with open(filename, "w") as f:
+                        f.write(doc.toprettyxml())
+
+                zip_buf = BytesIO()
+                with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for svg_file in os.listdir("svg_layers"):
+                        path = os.path.join("svg_layers", svg_file)
+                        zipf.write(path, svg_file)
+
+                st.download_button("⬇️ Download SVG ZIP", data=zip_buf.getvalue(), file_name="svg_layers_export.zip", mime="application/zip")
